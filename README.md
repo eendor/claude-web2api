@@ -2,7 +2,7 @@
 
 A small, (almost) zero-dependency proxy that exposes your **claude.ai web** session as an
 **OpenAI-compatible API** (`/v1/chat/completions`), so OpenAI-compatible clients — in
-particular [opencode](https://opencode.ai) — can use your Claude subscription (Sonnet, etc.)
+particular [opencode](https://opencode.ai) — can use your logged-in Claude account (Sonnet, etc.)
 as a model, **including agentic tool use**.
 
 > The only dependency is [`curl_cffi`](https://github.com/lexiforest/curl_cffi), used to
@@ -137,5 +137,11 @@ function-calling. This proxy:
 - Prompt-level tool-calling is less reliable than a native function-calling API. It works well
   with Sonnet but can occasionally need a retry.
 - No token counts (claude.ai doesn't send any) — usage is the 5h / 7d percentages only.
+- **Usage limits are the real ceiling.** claude.ai meters a rolling **5-hour** and **7-day**
+  window (not tokens), and they are small on the free plan. Agentic use makes many calls per
+  task, so the 5h window can be exhausted quickly — then you are rate-limited until it refills.
+  Watch it with `GET /usage`.
+- **Model access depends on your plan.** Sonnet is available on the free plan; Opus and other
+  top models require a paid plan and otherwise return `403 "upgrade your plan"`.
 - Firefox only for automatic cookie reading (its cookies are unencrypted on disk on Linux).
 - Unofficial; see the disclaimer above.
