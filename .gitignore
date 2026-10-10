@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+.env
+*.sqlite
+*.sqlite-*
+cookies.sqlite
