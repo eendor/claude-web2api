@@ -50,12 +50,13 @@ import re
 import sys
 import time
 import uuid
+import base64
 import signal
 import hashlib
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from curl_cffi import requests
+from curl_cffi import requests, CurlMime
 
 BASE = "https://claude.ai"
 ROOT_MSG = "00000000-0000-4000-8000-000000000000"
@@ -285,7 +286,7 @@ class ClaudeClient:
         except Exception:
             return cid
 
-    def completion(self, conv, prompt, model, parent=ROOT_MSG):
+    def completion(self, conv, prompt, model, parent=ROOT_MSG, files=None):
         """Yield text pieces from the claude.ai SSE stream; capture the new
         assistant message uuid in self.last_uuid to thread the next turn."""
         org = self.org()
@@ -295,7 +296,7 @@ class ClaudeClient:
             "timezone": "America/Los_Angeles",
             "model": model,
             "attachments": [],
-            "files": [],
+            "files": files or [],
             "sync_sources": [],
             "rendering_mode": "messages",
             "personalized_styles": NORMAL_STYLE,
@@ -337,6 +338,62 @@ class ClaudeClient:
                     self.last_uuid = value
         finally:
             r.close()
+
+    def upload_file(self, data, mime, name):
+        """Upload bytes to claude.ai; return the file_uuid to put in `files`."""
+        org = self.org()
+        mp = CurlMime()
+        mp.addpart(name="file", filename=name, content_type=mime, data=data)
+        h = {k: v for k, v in self._headers(referer="/new").items() if k.lower() != "content-type"}
+        kw = {"proxies": {"http": PROXY, "https": PROXY}} if PROXY else {}
+        try:
+            r = self.s.post(BASE + f"/api/{org}/upload", headers=h,
+                            cookies=None if self.cookie else {"sessionKey": SESSION_KEY},
+                            multipart=mp, timeout=120, **kw)
+        except Exception as e:
+            raise ClaudeError(502, f"upload failed: {e}")
+        if r.status_code != 200:
+            raise ClaudeError(r.status_code, f"upload: {r.status_code} {r.text[:150]}")
+        try:
+            return (r.json() or {}).get("file_uuid")
+        except Exception:
+            return None
+
+    def images_in(self, messages):
+        """Upload every image found in these messages and return their file_uuids.
+        Failures are skipped so the turn still goes through as text."""
+        uuids = []
+        for m in messages:
+            content = m.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "image_url":
+                    url = (part.get("image_url") or {}).get("url") or ""
+                elif part.get("type") in ("image", "input_image"):
+                    url = part.get("image") or part.get("url") or ""
+                else:
+                    continue
+                got = _data_url(url)
+                if not got and url.startswith(("http://", "https://")):
+                    try:
+                        resp = self.s.get(url, timeout=30)
+                        if resp.status_code == 200:
+                            mime = (resp.headers.get("content-type") or "image/png").split(";")[0].strip()
+                            got = (resp.content, mime or "image/png", "image." + (mime.split("/")[-1] or "png"))
+                    except Exception:
+                        got = None
+                if not got:
+                    continue
+                try:
+                    fid = self.upload_file(*got)
+                    if fid:
+                        uuids.append(fid)
+                except ClaudeError:
+                    pass
+        return uuids
 
     def delete_conversation(self, conv):
         try:
@@ -414,6 +471,22 @@ def usage_report():
 # ---------------------------------------------------------------------------
 # OpenAI <-> prompt translation
 # ---------------------------------------------------------------------------
+def _data_url(url):
+    """Decode a base64 data: URL into (bytes, mime, filename), else None."""
+    if not url.startswith("data:") or "," not in url:
+        return None
+    head, b64 = url[5:].split(",", 1)
+    if "base64" not in head:
+        return None
+    mime = (head.split(";")[0] or "image/png").strip() or "image/png"
+    try:
+        data = base64.b64decode(b64)
+    except Exception:
+        return None
+    ext = (mime.split("/")[-1] or "png").split("+")[0] or "png"
+    return data, mime, "image." + ext
+
+
 def _text_of(content):
     if isinstance(content, list):
         return "\n".join(p.get("text", "") for p in content
@@ -594,6 +667,11 @@ def _fingerprint(messages):
         h.update((m.get("role") or "").encode())
         h.update(b"\x00")
         h.update(_text_of(m.get("content")).encode("utf-8", "replace"))
+        if isinstance(m.get("content"), list):
+            for part in m["content"]:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    h.update(b"\x00img\x00")
+                    h.update(((part.get("image_url") or {}).get("url") or "").encode("utf-8", "replace"))
         for tc in m.get("tool_calls") or []:
             fn = tc.get("function") or {}
             args = fn.get("arguments")
@@ -757,18 +835,19 @@ class Handler(BaseHTTPRequestHandler):
             conv, parent, n = hit
             turn = build_turn(messages[n:], tools if agent else None, tool_choice)
             if turn:
-                return conv, turn, parent, fps, True
+                return conv, turn, parent, fps, True, messages[n:]
         conv = c.create_conversation()
         prompt = build_prompt(messages, tools if agent else None, tool_choice)
-        return conv, prompt, ROOT_MSG, fps, False
+        return conv, prompt, ROOT_MSG, fps, False, messages
 
     def _complete(self, c, messages, tools, tool_choice, model, emit):
         """Run one turn (reused or fresh), feeding text pieces to emit(), then
         record the thread so the next turn continues it. Falls back to a fresh
         full-history turn if a reused turn fails before any output."""
         agent = bool(tools) and tool_choice != "none"
-        conv, prompt, parent, fps, reuse = self._prepare(c, messages, tools, tool_choice)
-        self.log_message("turn=%s conv=%s", "reuse" if reuse else "fresh", conv[:8])
+        conv, prompt, parent, fps, reuse, turn_msgs = self._prepare(c, messages, tools, tool_choice)
+        files = c.images_in(turn_msgs)
+        self.log_message("turn=%s conv=%s files=%d", "reuse" if reuse else "fresh", conv[:8], len(files))
         sent = {"any": False}
 
         def _emit(p):
@@ -776,7 +855,7 @@ class Handler(BaseHTTPRequestHandler):
             emit(p)
 
         try:
-            for piece in c.completion(conv, prompt, model, parent):
+            for piece in c.completion(conv, prompt, model, parent, files):
                 _emit(piece)
         except ClaudeError:
             if not reuse or sent["any"]:
@@ -786,7 +865,8 @@ class Handler(BaseHTTPRequestHandler):
             conv = c.create_conversation()
             c.last_uuid = None
             prompt = build_prompt(messages, tools if agent else None, tool_choice)
-            for piece in c.completion(conv, prompt, model, ROOT_MSG):
+            files = c.images_in(messages)
+            for piece in c.completion(conv, prompt, model, ROOT_MSG, files):
                 _emit(piece)
         with _sess_lock:
             _store_session(conv, fps, c.last_uuid or parent)
@@ -858,6 +938,11 @@ def selftest():
     assert build_prompt([{"role": "user", "content": [
         {"type": "text", "text": "a"}, {"type": "image_url", "image_url": {}},
         {"type": "text", "text": "b"}]}]) == "Human: a\nb"
+
+    # image data URL decoding (images get uploaded as files, not inlined as text)
+    _d, _m, _n = _data_url("data:image/png;base64," + base64.b64encode(b"PNGDATA").decode())
+    assert _d == b"PNGDATA" and _m == "image/png" and _n == "image.png"
+    assert _data_url("data:text/plain,hi") is None and _data_url("https://x/y.png") is None
 
     # tool instructions appended, tag present
     p = build_prompt([{"role": "user", "content": "x"}],

@@ -25,6 +25,8 @@ as a model, **including agentic tool use**.
 - **Conversation reuse**: keeps one claude.ai thread per session and sends only each new turn
   instead of replaying the whole history every tool step — much easier on your usage limits.
 - **Native web search** + configurable thinking **effort** (`low`…`max`).
+- **Image attachments**: images in a message are uploaded to claude.ai and attached, so
+  Claude's vision works (sent as files, not inlined text).
 - **Usage meter**: `GET /usage` reports how much of your rolling **5h / 7d** limits you've used
   (claude.ai doesn't expose token counts; this is its own metric).
 
